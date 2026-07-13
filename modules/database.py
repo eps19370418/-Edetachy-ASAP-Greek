@@ -3,14 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 import csv
 import hashlib
-import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+import psycopg2
+import psycopg2.extras
+import streamlit as st
+
+USERS_TABLE = "greek_users"
+PROGRESS_TABLE = "greek_progress"
+
 CATEGORY_TABLES = {
-    "vocab": "vocab",
-    "aorist": "aorist",
-    "participle": "participle",
+    "vocab": "greek_vocab",
+    "aorist": "greek_aorist",
+    "participle": "greek_participle",
 }
 
 EXPECTED_COLUMNS = {
@@ -26,11 +32,51 @@ EXPECTED_COLUMNS = {
 }
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+class _ConnWrapper:
+    """Thin wrapper so psycopg2 connections support the same
+    conn.execute(...) shorthand that sqlite3.Connection provides."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=None):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params or ())
+        return cur
+
+    def executemany(self, sql, seq_of_params):
+        cur = self._conn.cursor()
+        cur.executemany(sql, seq_of_params)
+        return cur
+
+    def executescript(self, sql):
+        cur = self._conn.cursor()
+        cur.execute(sql)
+        return cur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self._conn.commit()
+        else:
+            self._conn.rollback()
+        self._conn.close()
+        return False
+
+
+def connect(db_path: Path | None = None) -> _ConnWrapper:
+    cfg = st.secrets["postgres"]
+    conn = psycopg2.connect(
+        host=cfg["host"],
+        port=cfg["port"],
+        dbname=cfg["database"],
+        user=cfg["user"],
+        password=cfg["password"],
+        sslmode="require",
+    )
+    return _ConnWrapper(conn)
 
 
 def now_iso() -> str:
@@ -41,37 +87,36 @@ def hash_pin(pin: str) -> str:
     return hashlib.sha256(pin.encode("utf-8")).hexdigest()
 
 
-def init_db(db_path: Path) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+def init_db(db_path: Path | None = None) -> None:
     with connect(db_path) as conn:
         conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            f"""
+            CREATE TABLE IF NOT EXISTS {USERS_TABLE} (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
                 pin_hash TEXT NOT NULL,
                 role TEXT NOT NULL CHECK(role IN ('student', 'teacher', 'admin')),
-                created_at TEXT NOT NULL
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
 
-            CREATE TABLE IF NOT EXISTS vocab (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS greek_vocab (
+                id SERIAL PRIMARY KEY,
                 rank INTEGER NOT NULL,
                 greek TEXT NOT NULL,
                 meaning TEXT NOT NULL,
                 hint TEXT NOT NULL DEFAULT ''
             );
 
-            CREATE TABLE IF NOT EXISTS aorist (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS greek_aorist (
+                id SERIAL PRIMARY KEY,
                 rank INTEGER NOT NULL,
                 present TEXT NOT NULL,
                 aorist TEXT NOT NULL,
                 meaning TEXT NOT NULL DEFAULT ''
             );
 
-            CREATE TABLE IF NOT EXISTS participle (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS greek_participle (
+                id SERIAL PRIMARY KEY,
                 rank INTEGER NOT NULL,
                 present TEXT NOT NULL,
                 present_participle TEXT NOT NULL,
@@ -79,69 +124,19 @@ def init_db(db_path: Path) -> None:
                 meaning TEXT NOT NULL DEFAULT ''
             );
 
-            CREATE TABLE IF NOT EXISTS progress (
-                user_id INTEGER NOT NULL,
+            CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} (
+                user_id INTEGER NOT NULL REFERENCES {USERS_TABLE}(id) ON DELETE CASCADE,
                 category TEXT NOT NULL,
                 card_id INTEGER NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('known', 'familiar', 'unknown')),
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (user_id, category, card_id),
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (user_id, category, card_id)
             );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS greek_users_name_lower_idx
+            ON {USERS_TABLE} (LOWER(name));
             """
         )
-    _migrate_users_role_if_needed(db_path)
-
-
-def _migrate_users_role_if_needed(db_path: Path) -> None:
-    """Allow the admin role in databases created by earlier alpha versions."""
-    conn = sqlite3.connect(db_path)
-    try:
-        sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
-        ).fetchone()
-        users_sql = (sql_row[0] or "") if sql_row else ""
-        if "'admin'" in users_sql:
-            return
-
-        conn.execute("PRAGMA foreign_keys = OFF")
-        conn.executescript(
-            """
-            BEGIN;
-            ALTER TABLE progress RENAME TO progress_old;
-            ALTER TABLE users RENAME TO users_old;
-
-            CREATE TABLE users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                pin_hash TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('student', 'teacher', 'admin')),
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE progress (
-                user_id INTEGER NOT NULL,
-                category TEXT NOT NULL,
-                card_id INTEGER NOT NULL,
-                status TEXT NOT NULL CHECK(status IN ('known', 'familiar', 'unknown')),
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (user_id, category, card_id),
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-
-            INSERT INTO users(id, name, pin_hash, role, created_at)
-            SELECT id, name, pin_hash, role, created_at FROM users_old;
-
-            INSERT INTO progress(user_id, category, card_id, status, updated_at)
-            SELECT user_id, category, card_id, status, updated_at FROM progress_old;
-
-            DROP TABLE progress_old;
-            DROP TABLE users_old;
-            COMMIT;
-            """
-        )
-    finally:
-        conn.close()
 
 
 def create_user(db_path: Path, name: str, pin: str, role: str) -> tuple[bool, str]:
@@ -156,18 +151,18 @@ def create_user(db_path: Path, name: str, pin: str, role: str) -> tuple[bool, st
     try:
         with connect(db_path) as conn:
             conn.execute(
-                "INSERT INTO users(name, pin_hash, role, created_at) VALUES (?, ?, ?, ?)",
+                f"INSERT INTO {USERS_TABLE}(name, pin_hash, role, created_at) VALUES (%s, %s, %s, %s)",
                 (name, hash_pin(pin), role, now_iso()),
             )
         return True, "Created."
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return False, "That name is already registered."
 
 
 def authenticate(db_path: Path, name: str, pin: str) -> dict[str, Any] | None:
     with connect(db_path) as conn:
         row = conn.execute(
-            "SELECT id, name, role FROM users WHERE name = ? COLLATE NOCASE AND pin_hash = ?",
+            f"SELECT id, name, role FROM {USERS_TABLE} WHERE LOWER(name) = LOWER(%s) AND pin_hash = %s",
             (name.strip(), hash_pin(pin)),
         ).fetchone()
     return dict(row) if row else None
@@ -176,22 +171,21 @@ def authenticate(db_path: Path, name: str, pin: str) -> dict[str, Any] | None:
 def list_users(db_path: Path) -> list[dict[str, Any]]:
     with connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT id, name, role, created_at FROM users ORDER BY role DESC, name"
+            f"SELECT id, name, role, created_at FROM {USERS_TABLE} ORDER BY role DESC, name"
         ).fetchall()
     return [dict(r) for r in rows]
 
 
 def delete_user(db_path: Path, user_id: int) -> bool:
-    """Delete one user and their progress. Returns True when a row was deleted."""
     with connect(db_path) as conn:
-        cursor = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        cursor = conn.execute(f"DELETE FROM {USERS_TABLE} WHERE id = %s", (user_id,))
     return cursor.rowcount > 0
 
 
 def seed_if_empty(db_path: Path, data_dir: Path) -> None:
     for category, table in CATEGORY_TABLES.items():
         with connect(db_path) as conn:
-            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            count = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
         if count == 0:
             csv_path = data_dir / f"{category}.csv"
             if csv_path.exists():
@@ -229,13 +223,12 @@ def read_csv_rows(path_or_file: Any, category: str) -> list[dict[str, str]]:
 def replace_cards(db_path: Path, category: str, rows: list[dict[str, str]]) -> None:
     table = CATEGORY_TABLES[category]
     columns = EXPECTED_COLUMNS[category]
-    placeholders = ", ".join("?" for _ in columns)
+    placeholders = ", ".join("%s" for _ in columns)
     column_sql = ", ".join(columns)
 
     with connect(db_path) as conn:
-        conn.execute("DELETE FROM progress WHERE category = ?", (category,))
+        conn.execute(f"DELETE FROM {PROGRESS_TABLE} WHERE category = %s", (category,))
         conn.execute(f"DELETE FROM {table}")
-        conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (table,))
         conn.executemany(
             f"INSERT INTO {table} ({column_sql}) VALUES ({placeholders})",
             [
@@ -255,7 +248,7 @@ def get_cards(db_path: Path, category: str) -> list[dict[str, Any]]:
 def get_card(db_path: Path, category: str, card_id: int) -> dict[str, Any] | None:
     table = CATEGORY_TABLES[category]
     with connect(db_path) as conn:
-        row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (card_id,)).fetchone()
+        row = conn.execute(f"SELECT * FROM {table} WHERE id = %s", (card_id,)).fetchone()
     return dict(row) if row else None
 
 
@@ -266,13 +259,13 @@ def get_unseen_ids(db_path: Path, user_id: int, category: str, limit: int = 20) 
             f"""
             SELECT c.id
             FROM {table} c
-            LEFT JOIN progress p
+            LEFT JOIN {PROGRESS_TABLE} p
               ON p.card_id = c.id
-             AND p.category = ?
-             AND p.user_id = ?
+             AND p.category = %s
+             AND p.user_id = %s
             WHERE p.card_id IS NULL
             ORDER BY c.rank, c.id
-            LIMIT ?
+            LIMIT %s
             """,
             (category, user_id, limit),
         ).fetchall()
@@ -288,11 +281,11 @@ def get_ids_by_status(
             f"""
             SELECT c.id
             FROM {table} c
-            JOIN progress p
+            JOIN {PROGRESS_TABLE} p
               ON p.card_id = c.id
-             AND p.category = ?
-             AND p.user_id = ?
-            WHERE p.status = ?
+             AND p.category = %s
+             AND p.user_id = %s
+            WHERE p.status = %s
             ORDER BY c.rank, c.id
             """,
             (category, user_id, status),
@@ -305,9 +298,9 @@ def save_progress(
 ) -> None:
     with connect(db_path) as conn:
         conn.execute(
-            """
-            INSERT INTO progress(user_id, category, card_id, status, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            f"""
+            INSERT INTO {PROGRESS_TABLE}(user_id, category, card_id, status, updated_at)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT(user_id, category, card_id)
             DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at
             """,
@@ -319,12 +312,12 @@ def progress_counts(db_path: Path, user_id: int, category: str) -> dict[str, int
     result = {"known": 0, "familiar": 0, "unknown": 0, "unseen": 0}
     table = CATEGORY_TABLES[category]
     with connect(db_path) as conn:
-        total = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
         rows = conn.execute(
-            """
+            f"""
             SELECT status, COUNT(*) AS n
-            FROM progress
-            WHERE user_id = ? AND category = ?
+            FROM {PROGRESS_TABLE}
+            WHERE user_id = %s AND category = %s
             GROUP BY status
             """,
             (user_id, category),
@@ -344,10 +337,10 @@ def user_progress_rows(db_path: Path, category: str) -> list[dict[str, Any]]:
         rows = conn.execute(
             f"""
             SELECT c.rank, c.{display_col} AS card, u.name, p.status, p.updated_at
-            FROM progress p
-            JOIN users u ON u.id = p.user_id
+            FROM {PROGRESS_TABLE} p
+            JOIN {USERS_TABLE} u ON u.id = p.user_id
             JOIN {table} c ON c.id = p.card_id
-            WHERE p.category = ?
+            WHERE p.category = %s
             ORDER BY c.rank, u.name
             """,
             (category,),
@@ -364,16 +357,16 @@ def reset_progress(
     clauses = []
     params: list[Any] = []
     if user_id is not None:
-        clauses.append("user_id = ?")
+        clauses.append("user_id = %s")
         params.append(user_id)
     if category is not None:
-        clauses.append("category = ?")
+        clauses.append("category = %s")
         params.append(category)
     if status is not None:
-        clauses.append("status = ?")
+        clauses.append("status = %s")
         params.append(status)
 
-    sql = "DELETE FROM progress"
+    sql = f"DELETE FROM {PROGRESS_TABLE}"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     with connect(db_path) as conn:
@@ -395,11 +388,11 @@ def cards_for_export(
             f"""
             SELECT c.*
             FROM {table} c
-            JOIN progress p
+            JOIN {PROGRESS_TABLE} p
               ON p.card_id = c.id
-             AND p.category = ?
-             AND p.user_id = ?
-            WHERE p.status = ?
+             AND p.category = %s
+             AND p.user_id = %s
+            WHERE p.status = %s
             ORDER BY c.rank, c.id
             """,
             (category, user_id, status),
@@ -414,11 +407,6 @@ def progress_text_rows(
     user_id: int | None = None,
     common_to_all_students: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return full card rows for teacher-side text extraction.
-
-    When ``common_to_all_students`` is True, only cards assigned the selected
-    status by every currently registered student are returned.
-    """
     table = CATEGORY_TABLES[category]
     columns = EXPECTED_COLUMNS[category]
     select_columns = ", ".join(f"c.{col}" for col in columns)
@@ -426,8 +414,8 @@ def progress_text_rows(
     with connect(db_path) as conn:
         if common_to_all_students:
             student_count = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE role = 'student'"
-            ).fetchone()[0]
+                f"SELECT COUNT(*) AS n FROM {USERS_TABLE} WHERE role = 'student'"
+            ).fetchone()["n"]
             if student_count == 0:
                 return []
 
@@ -435,15 +423,15 @@ def progress_text_rows(
                 f"""
                 SELECT {select_columns}
                 FROM {table} c
-                JOIN progress p
+                JOIN {PROGRESS_TABLE} p
                   ON p.card_id = c.id
-                 AND p.category = ?
-                 AND p.status = ?
-                JOIN users u
+                 AND p.category = %s
+                 AND p.status = %s
+                JOIN {USERS_TABLE} u
                   ON u.id = p.user_id
                  AND u.role = 'student'
-                GROUP BY c.id
-                HAVING COUNT(DISTINCT u.id) = ?
+                GROUP BY c.id, {select_columns}
+                HAVING COUNT(DISTINCT u.id) = %s
                 ORDER BY c.rank, c.id
                 """,
                 (category, status, student_count),
@@ -455,14 +443,15 @@ def progress_text_rows(
                 f"""
                 SELECT {select_columns}
                 FROM {table} c
-                JOIN progress p
+                JOIN {PROGRESS_TABLE} p
                   ON p.card_id = c.id
-                 AND p.category = ?
-                 AND p.user_id = ?
-                WHERE p.status = ?
+                 AND p.category = %s
+                 AND p.user_id = %s
+                WHERE p.status = %s
                 ORDER BY c.rank, c.id
                 """,
                 (category, user_id, status),
             ).fetchall()
 
     return [dict(row) for row in rows]
+
