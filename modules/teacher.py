@@ -295,3 +295,66 @@ def render(db_path: Path, lang: str) -> None:
         )
         st.success("削除しました。" if lang == "ja" else "Deleted.")
         st.rerun()
+
+    st.divider()
+    st.markdown("### " + ("教材別 学習状況" if lang == "ja" else "Progress by material"))
+
+    material_sets = database.list_material_sets(active_only=False)
+    if not material_sets:
+        st.info(
+            "登録されている教材はありません。"
+            if lang == "ja"
+            else "No materials registered yet."
+        )
+    else:
+        material_options = {m["title"]: m["id"] for m in material_sets}
+        selected_material_title = st.selectbox(
+            "教材" if lang == "ja" else "Material",
+            list(material_options.keys()),
+            key="teacher_material_select",
+        )
+        selected_material_id = material_options[selected_material_title]
+
+        items = database.get_material_items(selected_material_id)
+        total_items = len(items)
+
+        overview = database.material_teacher_overview(selected_material_id)
+
+        st.caption(
+            f"利用者数: {len(overview)}"
+            if lang == "ja"
+            else f"Participants: {len(overview)}"
+        )
+
+        if not overview:
+            st.info(
+                "この教材の学習履歴はまだありません。"
+                if lang == "ja"
+                else "No progress recorded for this material yet."
+            )
+        else:
+            material_rows = []
+            for row in overview:
+                known = row["known"]
+                familiar = row["familiar"]
+                unknown = row["unknown"]
+                unseen = total_items - (known + familiar + unknown)
+                material_rows.append(
+                    {
+                        "name": row["name"],
+                        "known": known,
+                        "familiar": familiar,
+                        "unknown": unknown,
+                        "unseen": unseen,
+                    }
+                )
+            material_df = pd.DataFrame(material_rows).rename(
+                columns={
+                    "name": "参加者名" if lang == "ja" else "Name",
+                    "known": "覚えた" if lang == "ja" else "Known",
+                    "familiar": "見たことがある" if lang == "ja" else "Familiar",
+                    "unknown": "わからない" if lang == "ja" else "Unknown",
+                    "unseen": "未学習" if lang == "ja" else "Unseen",
+                }
+            )
+            st.dataframe(material_df, use_container_width=True, hide_index=True)

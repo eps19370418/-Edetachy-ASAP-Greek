@@ -21,7 +21,9 @@ from modules import database
 
 
 def find_unicode_font() -> str | None:
+    bundled = Path(__file__).resolve().parent.parent / "assets" / "fonts" / "DejaVuSans.ttf"
     candidates = [
+        str(bundled),
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
