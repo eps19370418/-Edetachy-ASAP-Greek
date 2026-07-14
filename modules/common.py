@@ -158,3 +158,132 @@ def render_card_trainer(
                     queue.pop(0)
                     st.session_state.pop(reveal_key, None)
                     st.rerun()
+# ============================================================
+# 汎用教材セット用トレーナー（フェーズ1: 新規教材用）
+# render_card_trainer と同じロジックを material_* 関数で再現
+# ============================================================
+
+MATERIAL_STATUS_TEXT = STATUS_TEXT
+
+
+def _material_queue_key(material_set_id: int, mode: str, user_id: int) -> str:
+    return f"mqueue_{material_set_id}_{mode}_{user_id}"
+
+
+def _material_reveal_key(material_set_id: int, item_id: int, user_id: int) -> str:
+    return f"mreveal_{material_set_id}_{item_id}_{user_id}"
+
+
+def reset_material_queue(material_set_id: int, mode: str, user_id: int) -> None:
+    st.session_state.pop(_material_queue_key(material_set_id, mode, user_id), None)
+
+
+def render_material_trainer(
+    material_set_id: int,
+    user_id: int,
+    lang: str,
+    front_renderer: Callable[[dict], None],
+    answer_renderer: Callable[[dict], None],
+) -> None:
+    t = MATERIAL_STATUS_TEXT[lang]
+    mode_label = st.radio(
+        "学習モード" if lang == "ja" else "Study mode",
+        [t["learn"], t["review"]],
+        horizontal=True,
+        key=f"mmode_{material_set_id}_{user_id}",
+        label_visibility="collapsed",
+    )
+    mode = "learn" if mode_label == t["learn"] else "review"
+
+    counts = database.material_progress_counts(user_id, material_set_id)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(t["known"], counts["known"])
+    c2.metric(t["familiar"], counts["familiar"])
+    c3.metric(t["unknown"], counts["unknown"])
+    c4.metric(t["unseen"], counts["unseen"])
+
+    key = _material_queue_key(material_set_id, mode, user_id)
+    if key not in st.session_state:
+        if mode == "learn":
+            st.session_state[key] = database.get_material_unseen_ids(
+                user_id, material_set_id, limit=20
+            )
+        else:
+            st.session_state[key] = database.get_material_ids_by_status(
+                user_id, material_set_id, "familiar"
+            )
+
+    queue = st.session_state[key]
+
+    if not queue:
+        if mode == "learn":
+            if counts["unseen"] == 0:
+                st.success(t["no_new"])
+            else:
+                st.success(t["done"])
+                if st.button(
+                    t["next_session"],
+                    use_container_width=True,
+                    key=f"mnew_session_{material_set_id}_{user_id}",
+                ):
+                    reset_material_queue(material_set_id, mode, user_id)
+                    st.rerun()
+        else:
+            st.info(t["no_review"])
+            if st.button(
+                t["restart_review"],
+                use_container_width=True,
+                key=f"mrefresh_review_{material_set_id}_{user_id}",
+            ):
+                reset_material_queue(material_set_id, mode, user_id)
+                st.rerun()
+        return
+
+    initial_size_key = f"minitial_size_{key}"
+    if initial_size_key not in st.session_state:
+        st.session_state[initial_size_key] = len(queue)
+    initial_size = st.session_state[initial_size_key]
+    completed = initial_size - len(queue)
+    st.progress(completed / max(initial_size, 1), text=f"{t['session']}: {completed}/{initial_size}")
+
+    item_id = queue[0]
+    card = database.get_material_item(item_id)
+    if card is None:
+        queue.pop(0)
+        st.rerun()
+
+    with st.container(border=True):
+        front_renderer(card)
+        reveal_key = _material_reveal_key(material_set_id, item_id, user_id)
+        revealed = st.session_state.get(reveal_key, False)
+
+        if not revealed:
+            if st.button(
+                t["show"],
+                use_container_width=True,
+                key=f"mshow_{material_set_id}_{item_id}_{user_id}",
+            ):
+                st.session_state[reveal_key] = True
+                st.rerun()
+        else:
+            st.divider()
+            answer_renderer(card)
+
+            cols = st.columns(3)
+            status_buttons = [
+                ("known", t["known"]),
+                ("familiar", t["familiar"]),
+                ("unknown", t["unknown"]),
+            ]
+            for col, (status, label) in zip(cols, status_buttons):
+                if col.button(
+                    label,
+                    use_container_width=True,
+                    key=f"m{material_set_id}_{item_id}_{status}_{user_id}",
+                ):
+                    database.save_material_progress(
+                        user_id, material_set_id, item_id, status
+                    )
+                    queue.pop(0)
+                    st.session_state.pop(reveal_key, None)
+                    st.rerun()

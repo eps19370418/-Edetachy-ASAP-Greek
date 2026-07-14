@@ -2,7 +2,7 @@ from pathlib import Path
 import os
 import streamlit as st
 
-from modules import auth, database, vocab, aorist, participle, teacher, admin, pdf_export
+from modules import auth, database, vocab, aorist, participle, materials, teacher, admin, pdf_export
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
@@ -27,6 +27,7 @@ TEXT = {
         "logout": "ログアウト",
         "logged_in": "ログイン中",
         "vocab": "単語",
+        "materials": "教材",
         "aorist": "アオリスト",
         "participle": "分詞",
         "exports": "PDF出力",
@@ -39,6 +40,7 @@ TEXT = {
         "logout": "Log out",
         "logged_in": "Signed in",
         "vocab": "Vocabulary",
+        "materials": "Materials",
         "aorist": "Aorist",
         "participle": "Participles",
         "exports": "PDF exports",
@@ -72,7 +74,7 @@ with st.sidebar:
 st.image(str(ASSETS_DIR / "edetachy_logo.png"), use_container_width=True)
 st.markdown(f"<h3 style='text-align:center;margin-top:-0.5rem'>{t['tagline']}</h3>", unsafe_allow_html=True)
 
-tab_names = [t["vocab"], t["aorist"], t["participle"], t["exports"]]
+tab_names = [t["vocab"], t["aorist"], t["participle"], t["materials"], t["exports"]]
 if user["role"] in {"teacher", "admin"}:
     tab_names.append(t["teacher"])
 if user["role"] == "admin":
@@ -90,9 +92,12 @@ with tabs[2]:
     participle.render(DB_PATH, user["id"], lang)
 
 with tabs[3]:
+    materials.render(user["id"], lang)
+
+with tabs[4]:
     pdf_export.render(DB_PATH, user["id"], lang)
 
-tab_index = 4
+tab_index = 5
 if user["role"] in {"teacher", "admin"}:
     with tabs[tab_index]:
         teacher.render(DB_PATH, lang)

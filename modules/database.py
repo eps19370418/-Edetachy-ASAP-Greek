@@ -62,13 +62,14 @@ class _ConnWrapper:
             self._conn.commit()
         else:
             self._conn.rollback()
-        self._conn.close()
+        # 接続はキャッシュして使い回すため、ここでは close() しない
         return False
 
 
-def connect(db_path: Path | None = None) -> _ConnWrapper:
+@st.cache_resource(show_spinner=False)
+def _get_raw_connection():
     cfg = st.secrets["postgres"]
-    conn = psycopg2.connect(
+    return psycopg2.connect(
         host=cfg["host"],
         port=cfg["port"],
         dbname=cfg["database"],
@@ -76,6 +77,16 @@ def connect(db_path: Path | None = None) -> _ConnWrapper:
         password=cfg["password"],
         sslmode="require",
     )
+
+
+def connect(db_path: Path | None = None) -> _ConnWrapper:
+    try:
+        conn = _get_raw_connection()
+        if conn.closed:
+            raise psycopg2.OperationalError("connection closed")
+    except psycopg2.OperationalError:
+        _get_raw_connection.clear()
+        conn = _get_raw_connection()
     return _ConnWrapper(conn)
 
 
@@ -454,4 +465,292 @@ def progress_text_rows(
             ).fetchall()
 
     return [dict(row) for row in rows]
+# ============================================================
+# 汎用教材セット機能（フェーズ1: 新規教材用）
+# 既存の CATEGORY_TABLES / greek_progress とは独立して動作する
+# ============================================================
 
+MATERIAL_SETS_TABLE = "greek_material_sets"
+MATERIAL_ITEMS_TABLE = "greek_material_items"
+MATERIAL_PROGRESS_TABLE = "greek_material_progress"
+
+MATERIAL_EXPECTED_COLUMNS = ["rank", "greek", "meaning", "hint"]
+
+
+def list_material_sets(active_only: bool = True) -> list[dict[str, Any]]:
+    with connect() as conn:
+        sql = f"SELECT * FROM {MATERIAL_SETS_TABLE}"
+        if active_only:
+            sql += " WHERE is_active = true"
+        sql += " ORDER BY display_order, id"
+        rows = conn.execute(sql).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_material_set(material_set_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            f"SELECT * FROM {MATERIAL_SETS_TABLE} WHERE id = %s", (material_set_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_material_set(
+    title: str, category: str = "vocab", description: str = ""
+) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            f"""
+            INSERT INTO {MATERIAL_SETS_TABLE} (title, category, description)
+            VALUES (%s, %s, %s)
+            RETURNING id
+            """,
+            (title, category, description),
+        )
+        new_id = cur.fetchone()["id"]
+    return int(new_id)
+
+
+def set_material_active(material_set_id: int, is_active: bool) -> None:
+    with connect() as conn:
+        conn.execute(
+            f"UPDATE {MATERIAL_SETS_TABLE} SET is_active = %s WHERE id = %s",
+            (is_active, material_set_id),
+        )
+
+
+def delete_material_set(material_set_id: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            f"DELETE FROM {MATERIAL_SETS_TABLE} WHERE id = %s", (material_set_id,)
+        )
+
+
+def import_material_items(
+    material_set_id: int, rows: list[dict[str, str]], replace: bool = True
+) -> int:
+    """Insert CSV rows as material items. If replace=True, wipes existing
+    items (and their progress) for this material set first."""
+    with connect() as conn:
+        if replace:
+            conn.execute(
+                f"DELETE FROM {MATERIAL_PROGRESS_TABLE} WHERE material_set_id = %s",
+                (material_set_id,),
+            )
+            conn.execute(
+                f"DELETE FROM {MATERIAL_ITEMS_TABLE} WHERE material_set_id = %s",
+                (material_set_id,),
+            )
+        conn.executemany(
+            f"""
+            INSERT INTO {MATERIAL_ITEMS_TABLE}
+                (material_set_id, rank, greek, meaning, hint)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            [
+                (
+                    material_set_id,
+                    int(row["rank"]),
+                    row["greek"],
+                    row["meaning"],
+                    row.get("hint", ""),
+                )
+                for row in rows
+            ],
+        )
+    return len(rows)
+
+
+def read_material_csv_rows(path_or_file: Any) -> list[dict[str, str]]:
+    if hasattr(path_or_file, "getvalue"):
+        text = path_or_file.getvalue().decode("utf-8-sig")
+        lines = text.splitlines()
+    else:
+        with open(path_or_file, "r", encoding="utf-8-sig", newline="") as f:
+            lines = f.read().splitlines()
+
+    reader = csv.DictReader(lines)
+    actual = reader.fieldnames or []
+    missing = [c for c in MATERIAL_EXPECTED_COLUMNS if c not in actual]
+    if missing:
+        raise ValueError(f"Missing columns: {', '.join(missing)}")
+
+    rows: list[dict[str, str]] = []
+    for index, row in enumerate(reader, start=1):
+        cleaned = {key: (row.get(key) or "").strip() for key in MATERIAL_EXPECTED_COLUMNS}
+        cleaned["rank"] = cleaned["rank"] or str(index)
+        if not cleaned["greek"]:
+            continue
+        rows.append(cleaned)
+    return rows
+
+
+def get_material_items(material_set_id: int) -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM {MATERIAL_ITEMS_TABLE}
+            WHERE material_set_id = %s
+            ORDER BY rank, id
+            """,
+            (material_set_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_material_item(item_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            f"SELECT * FROM {MATERIAL_ITEMS_TABLE} WHERE id = %s",
+            (item_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_material_unseen_ids(
+    user_id: int, material_set_id: int, limit: int = 20
+) -> list[int]:
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT c.id
+            FROM {MATERIAL_ITEMS_TABLE} c
+            LEFT JOIN {MATERIAL_PROGRESS_TABLE} p
+              ON p.item_id = c.id
+             AND p.material_set_id = %s
+             AND p.user_id = %s
+            WHERE c.material_set_id = %s
+              AND p.item_id IS NULL
+            ORDER BY c.rank, c.id
+            LIMIT %s
+            """,
+            (material_set_id, user_id, material_set_id, limit),
+        ).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
+def get_material_ids_by_status(
+    user_id: int, material_set_id: int, status: str
+) -> list[int]:
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT c.id
+            FROM {MATERIAL_ITEMS_TABLE} c
+            JOIN {MATERIAL_PROGRESS_TABLE} p
+              ON p.item_id = c.id
+             AND p.material_set_id = %s
+             AND p.user_id = %s
+            WHERE p.status = %s
+            ORDER BY c.rank, c.id
+            """,
+            (material_set_id, user_id, status),
+        ).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
+def save_material_progress(
+    user_id: int, material_set_id: int, item_id: int, status: str
+) -> None:
+    with connect() as conn:
+        conn.execute(
+            f"""
+            INSERT INTO {MATERIAL_PROGRESS_TABLE}
+                (user_id, material_set_id, item_id, status, updated_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, material_set_id, item_id)
+            DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at
+            """,
+            (user_id, material_set_id, item_id, status, now_iso()),
+        )
+
+
+def material_progress_counts(user_id: int, material_set_id: int) -> dict[str, int]:
+    result = {"known": 0, "familiar": 0, "unknown": 0, "unseen": 0}
+    with connect() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) AS n FROM {MATERIAL_ITEMS_TABLE} WHERE material_set_id = %s",
+            (material_set_id,),
+        ).fetchone()["n"]
+        rows = conn.execute(
+            f"""
+            SELECT status, COUNT(*) AS n
+            FROM {MATERIAL_PROGRESS_TABLE}
+            WHERE user_id = %s AND material_set_id = %s
+            GROUP BY status
+            """,
+            (user_id, material_set_id),
+        ).fetchall()
+    seen_total = 0
+    for row in rows:
+        result[row["status"]] = row["n"]
+        seen_total += row["n"]
+    result["unseen"] = total - seen_total
+    return result
+
+
+def material_reset_progress(
+    material_set_id: int,
+    user_id: int | None = None,
+    status: str | None = None,
+) -> None:
+    clauses = ["material_set_id = %s"]
+    params: list[Any] = [material_set_id]
+    if user_id is not None:
+        clauses.append("user_id = %s")
+        params.append(user_id)
+    if status is not None:
+        clauses.append("status = %s")
+        params.append(status)
+
+    sql = f"DELETE FROM {MATERIAL_PROGRESS_TABLE} WHERE " + " AND ".join(clauses)
+    with connect() as conn:
+        conn.execute(sql, params)
+
+
+def material_teacher_overview(material_set_id: int) -> list[dict[str, Any]]:
+    """Per-student progress summary for one material set (for the
+    material-first teacher dashboard)."""
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                u.id AS user_id,
+                u.name,
+                COUNT(*) FILTER (WHERE p.status = 'known') AS known,
+                COUNT(*) FILTER (WHERE p.status = 'familiar') AS familiar,
+                COUNT(*) FILTER (WHERE p.status = 'unknown') AS unknown
+            FROM {MATERIAL_PROGRESS_TABLE} p
+            JOIN {USERS_TABLE} u ON u.id = p.user_id
+            WHERE p.material_set_id = %s
+            GROUP BY u.id, u.name
+            ORDER BY u.name
+            """,
+            (material_set_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def material_cards_for_export(
+    material_set_id: int,
+    user_id: int | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    if status is None or user_id is None:
+        return get_material_items(material_set_id)
+
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT c.*
+            FROM {MATERIAL_ITEMS_TABLE} c
+            JOIN {MATERIAL_PROGRESS_TABLE} p
+              ON p.item_id = c.id
+             AND p.material_set_id = %s
+             AND p.user_id = %s
+            WHERE p.status = %s
+            ORDER BY c.rank, c.id
+            """,
+            (material_set_id, user_id, status),
+        ).fetchall()
+    return [dict(r) for r in rows]
